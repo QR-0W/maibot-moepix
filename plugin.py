@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import os
+import random
 import time
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, Tuple
@@ -57,6 +58,7 @@ class ApiConfig(PluginConfigBase):
     default_num: int = Field(default=1, description="默认请求图片数量")
     default_size: List[str] = Field(default_factory=lambda: ["regular"], description="默认图片规格")
     proxy: str = Field(default="", description="图片反代地址，留空则使用 i.pximg.net")
+    http_proxy: str = Field(default="", description="HTTP 代理地址，用于访问被墙的 API。格式如 http://127.0.0.1:52117")
     exclude_ai: bool = Field(default=True, description="是否排除 AI 作品")
     max_num: int = Field(default=5, description="单次最大请求数量")
     send_mode: str = Field(default="image", description='发送模式: "image"(全发图片) 或 "link"(全发链接) 或 "both"(两者都发) 或 "kz_link"(全年龄发图片,扩展内容发链接)')
@@ -212,9 +214,13 @@ class SetuPlugin(MaiBotPlugin):
 
     async def _get_http_session(self) -> aiohttp.ClientSession:
         if self._http_session is None or self._http_session.closed:
-            self._http_session = aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=60, connect=15)
-            )
+            kwargs = {
+                "timeout": aiohttp.ClientTimeout(total=60, connect=15),
+            }
+            proxy_url = (self.config.api.http_proxy or "").strip()
+            if proxy_url:
+                kwargs["proxy"] = proxy_url
+            self._http_session = aiohttp.ClientSession(**kwargs)
         return self._http_session
 
     def _get_chat_id(self, group_id: str = "", user_id: str = "", stream_id: str = "") -> str:
@@ -342,6 +348,22 @@ class SetuPlugin(MaiBotPlugin):
         except Exception as e:
             return {"success": False, "error": "未知错误: " + str(e)}
 
+    @staticmethod
+    def _select_random_setu(setu_list: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """按 Pixiv 作品页去重，并从本批候选中随机选择一张。"""
+        unique_items = []
+        seen_keys = set()
+        for item in setu_list:
+            key = (item.get("pid"), item.get("p"))
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            unique_items.append(item)
+
+        if not unique_items:
+            return None
+        return random.choice(unique_items)
+
     async def _download_image_as_base64(self, url):
         try:
             session = await self._get_http_session()
@@ -384,72 +406,69 @@ class SetuPlugin(MaiBotPlugin):
             # 链接模式：直接发送图片链接文本
             if send_mode in ("link", "链接"):
                 link_text = title + " - " + author + "\n" + image_url
-                try:
-                    msg_id = await self._send_text_via_api(link_text, stream_id, group_id, user_id)
+                confirmed, msg_id, error = await self._send_text_via_api(link_text, stream_id, group_id, user_id)
+                if confirmed:
                     sent_count += 1
                     recall_sec = self.config.limits.recall_after_seconds
                     if recall_sec > 0 and msg_id:
                         asyncio.create_task(self._schedule_recall(stream_id, recall_sec, msg_id))
                         self.ctx.logger.info("[SetuPlugin] 链接已计划撤回 message_id=%s 延迟%ds", msg_id, recall_sec)
-                except Exception as e:
-                    info_lines.append("• " + r18_flag + title + " - 发送链接失败: " + str(e))
+                else:
+                    info_lines.append("• " + r18_flag + title + " - 发送链接失败: " + (error or "未知错误"))
                 continue
 
             # kz_link 模式：全年龄发图片，扩展内容发链接
             if send_mode == "kz_link" and is_r18_item:
                 link_text = title + " - " + author + "\n" + image_url
-                try:
-                    msg_id = await self._send_text_via_api(link_text, stream_id, group_id, user_id)
+                confirmed, msg_id, error = await self._send_text_via_api(link_text, stream_id, group_id, user_id)
+                if confirmed:
                     sent_count += 1
                     recall_sec = self.config.limits.recall_after_seconds
                     if recall_sec > 0 and msg_id:
                         asyncio.create_task(self._schedule_recall(stream_id, recall_sec, msg_id))
                         self.ctx.logger.info("[SetuPlugin] 链接已计划撤回 message_id=%s 延迟%ds", msg_id, recall_sec)
-                except Exception as e:
-                    info_lines.append("• " + r18_flag + title + " - 发送链接失败: " + str(e))
+                else:
+                    info_lines.append("• " + r18_flag + title + " - 发送链接失败: " + (error or "未知错误"))
                 continue
 
             # 图片模式 / kz_link 模式的全年龄部分 / both 模式
             b64_data = await self._download_image_as_base64(image_url)
             if not b64_data:
-                # 图片下载失败时回退到发链接
+                # 图片下载失败时回退到发链接（仅 both 模式）
                 if send_mode in ("both", "两者"):
-                    try:
-                        msg_id = await self._send_text_via_api(title + " - " + author + "\n" + image_url, stream_id, group_id, user_id)
+                    confirmed, msg_id, error = await self._send_text_via_api(title + " - " + author + "\n" + image_url, stream_id, group_id, user_id)
+                    if confirmed:
                         sent_count += 1
                         recall_sec = self.config.limits.recall_after_seconds
                         if recall_sec > 0 and msg_id:
                             asyncio.create_task(self._schedule_recall(stream_id, recall_sec, msg_id))
-                    except Exception as e:
-                        info_lines.append("• " + r18_flag + title + " - 发送失败: " + str(e))
+                    else:
+                        info_lines.append("• " + r18_flag + title + " - 发送失败: " + (error or "未知错误"))
                 else:
                     info_lines.append("• " + r18_flag + title + " - " + author + " - 图片下载失败")
                 continue
 
-            try:
-                msg_id = await self._send_image_via_api(b64_data, stream_id, group_id, user_id)
+            confirmed, msg_id, error = await self._send_image_via_api(b64_data, stream_id, group_id, user_id)
+            if confirmed:
                 sent_count += 1
                 recall_sec = self.config.limits.recall_after_seconds
                 if recall_sec > 0 and msg_id:
                     asyncio.create_task(self._schedule_recall(stream_id, recall_sec, msg_id))
                     self.ctx.logger.info("[SetuPlugin] 已计划撤回 message_id=%s 延迟%ds", msg_id, recall_sec)
-            except Exception as e:
-                info_lines.append("• " + r18_flag + title + " - " + author + " - 发送失败: " + str(e))
+            else:
+                info_lines.append("• " + r18_flag + title + " - " + author + " - 发送失败: " + (error or "未知错误"))
 
             # both 模式下同时发送链接
             if send_mode in ("both", "两者"):
-                try:
-                    link_msg_id = await self._send_text_via_api(title + " - " + author + "\n" + image_url, stream_id, group_id, user_id)
-                    recall_sec = self.config.limits.recall_after_seconds
-                    if recall_sec > 0 and link_msg_id:
-                        asyncio.create_task(self._schedule_recall(stream_id, recall_sec, link_msg_id))
-                except Exception:
-                    pass
+                link_confirmed, link_msg_id, _ = await self._send_text_via_api(title + " - " + author + "\n" + image_url, stream_id, group_id, user_id)
+                recall_sec = self.config.limits.recall_after_seconds
+                if recall_sec > 0 and link_msg_id:
+                    asyncio.create_task(self._schedule_recall(stream_id, recall_sec, link_msg_id))
 
         return sent_count, info_lines
 
     async def _send_image_via_api(self, b64_data, stream_id, group_id="", user_id=""):
-        """通过 NapCat send_msg API 发送图片，返回 message_id"""
+        """通过 NapCat send_msg API 发送图片，返回 (confirmed, message_id, error)。"""
         # 构造图片消息段
         image_segment = {
             "type": "image",
@@ -471,9 +490,7 @@ class SetuPlugin(MaiBotPlugin):
                 "message": [image_segment],
             }
         else:
-            # 回退：使用 ctx.send.image
-            await self.ctx.send.image(b64_data, stream_id)
-            return None
+            return (False, None, "缺少发送目标(group_id/user_id)")
 
         try:
             result = await self.ctx.api.call(
@@ -482,26 +499,41 @@ class SetuPlugin(MaiBotPlugin):
                 params=send_params,
             )
             self.ctx.logger.info("[SetuPlugin] send_msg API 返回: %s", result)
-            if isinstance(result, dict) and not result.get("success", True):
-                self.ctx.logger.warning("[SetuPlugin] send_msg API 失败，回退到 ctx.send.image")
-                await self.ctx.send.image(b64_data, stream_id)
-                return None
-            if isinstance(result, dict):
-                msg_id = result.get("message_id")
-                if not msg_id and isinstance(result.get("data"), dict):
-                    msg_id = result["data"].get("message_id")
-                if not msg_id:
-                    msg_id = result.get("external_message_id")
-                self.ctx.logger.info("[SetuPlugin] 提取到 message_id=%s", msg_id)
-                return msg_id
-            return None
+            # 运行时将 Adapter 异常包装为失败字典
+            if isinstance(result, dict) and result.get("success") is False:
+                error = str(result.get("error", "未知错误"))
+                self.ctx.logger.warning("[SetuPlugin] send_msg 返回失败，回退到 ctx.send.image: %s", error)
+                try:
+                    await self.ctx.send.image(b64_data, stream_id)
+                    return (True, None, None)
+                except Exception as fallback_error:
+                    return (False, None, "{}; fallback={}".format(error, fallback_error))
+
+            # 校验 NapCat 原生 ACK
+            if not isinstance(result, dict) or str(result.get("status", "")).lower() != "ok" or result.get("retcode") != 0:
+                error_msg = "平台返回非成功状态: {}".format(result)
+                self.ctx.logger.warning("[SetuPlugin] %s", error_msg)
+                return (False, None, error_msg)
+
+            # 提取 message_id（仅用于撤回，不影响发送成功判定）
+            msg_id = result.get("message_id")
+            if not msg_id and isinstance(result.get("data"), dict):
+                msg_id = result["data"].get("message_id")
+            if not msg_id:
+                msg_id = result.get("external_message_id")
+            self.ctx.logger.info("[SetuPlugin] 提取到 message_id=%s", msg_id)
+
+            return (True, msg_id, None)
         except Exception as e:
-            self.ctx.logger.error("[SetuPlugin] send_msg API 调用失败: %s，回退到 ctx.send.image", e)
-            await self.ctx.send.image(b64_data, stream_id)
-            return None
+            self.ctx.logger.error("[SetuPlugin] send_msg API 调用失败，回退到 ctx.send.image: %s", e)
+            try:
+                await self.ctx.send.image(b64_data, stream_id)
+                return (True, None, None)
+            except Exception as fallback_error:
+                return (False, None, "{}; fallback={}".format(e, fallback_error))
 
     async def _send_text_via_api(self, text, stream_id, group_id="", user_id=""):
-        """通过 NapCat send_msg API 发送文本消息，返回 message_id"""
+        """通过 NapCat send_msg API 发送文本消息，返回 (confirmed, message_id, error)。"""
         text_segment = {
             "type": "text",
             "data": {
@@ -522,9 +554,7 @@ class SetuPlugin(MaiBotPlugin):
                 "message": [text_segment],
             }
         else:
-            # 回退：使用 ctx.send.text
-            await self.ctx.send.text(text, stream_id)
-            return None
+            return (False, None, "缺少发送目标(group_id/user_id)")
 
         try:
             result = await self.ctx.api.call(
@@ -533,23 +563,38 @@ class SetuPlugin(MaiBotPlugin):
                 params=send_params,
             )
             self.ctx.logger.info("[SetuPlugin] send_text API 返回: %s", result)
-            if isinstance(result, dict) and not result.get("success", True):
-                self.ctx.logger.warning("[SetuPlugin] send_text API 失败，回退到 ctx.send.text")
-                await self.ctx.send.text(text, stream_id)
-                return None
-            if isinstance(result, dict):
-                msg_id = result.get("message_id")
-                if not msg_id and isinstance(result.get("data"), dict):
-                    msg_id = result["data"].get("message_id")
-                if not msg_id:
-                    msg_id = result.get("external_message_id")
-                self.ctx.logger.info("[SetuPlugin] 文本提取到 message_id=%s", msg_id)
-                return msg_id
-            return None
+            # 运行时将 Adapter 异常包装为失败字典
+            if isinstance(result, dict) and result.get("success") is False:
+                error = str(result.get("error", "未知错误"))
+                self.ctx.logger.warning("[SetuPlugin] send_text 返回失败，回退到 ctx.send.text: %s", error)
+                try:
+                    await self.ctx.send.text(text, stream_id)
+                    return (True, None, None)
+                except Exception as fallback_error:
+                    return (False, None, "{}; fallback={}".format(error, fallback_error))
+
+            # 校验 NapCat 原生 ACK
+            if not isinstance(result, dict) or str(result.get("status", "")).lower() != "ok" or result.get("retcode") != 0:
+                error_msg = "平台返回非成功状态: {}".format(result)
+                self.ctx.logger.warning("[SetuPlugin] %s", error_msg)
+                return (False, None, error_msg)
+
+            # 提取 message_id（仅用于撤回，不影响发送成功判定）
+            msg_id = result.get("message_id")
+            if not msg_id and isinstance(result.get("data"), dict):
+                msg_id = result["data"].get("message_id")
+            if not msg_id:
+                msg_id = result.get("external_message_id")
+            self.ctx.logger.info("[SetuPlugin] 文本提取到 message_id=%s", msg_id)
+
+            return (True, msg_id, None)
         except Exception as e:
-            self.ctx.logger.error("[SetuPlugin] send_text API 调用失败: %s，回退到 ctx.send.text", e)
-            await self.ctx.send.text(text, stream_id)
-            return None
+            self.ctx.logger.error("[SetuPlugin] send_text API 调用失败，回退到 ctx.send.text: %s", e)
+            try:
+                await self.ctx.send.text(text, stream_id)
+                return (True, None, None)
+            except Exception as fallback_error:
+                return (False, None, "{}; fallback={}".format(e, fallback_error))
 
     async def _schedule_recall(self, stream_id, seconds, message_id=None):
         try:
@@ -577,14 +622,16 @@ class SetuPlugin(MaiBotPlugin):
         description=(
             "获取二次元图片/美图/涩图。当用户表达想要看图片、二次元图、动漫图、美图、"
             "色图、涩图等意图时，都可以调用此工具。默认返回全年龄向的二次元图片。"
-            "仅当用户明确、反复要求 R18/成人/色情内容时，才设置 r18=true；"
-            "不要仅因为用户说“色图/涩图”就设置 r18=true，也不要主动询问用户是否需要 R18，"
-            "也不要主动检查 R18 权限。"
+            "用户明确要求 R18、成人向或色情内容时设置 r18=true；明确要求全年龄或非 R18 "
+            "内容时设置 r18=false。不要仅因用户使用\u201c色图\u201d或\u201c涩图\u201d就设置 r18=true。"
+            "内容级别词只用于决定 r18 参数，主题概念应按 tags 参数说明转换为 Pixiv 常用标签。"
+            "不要主动询问用户是否需要 R18，也不要主动检查 R18 权限。"
             "注意：Lolicon 使用 Pixiv 标签精确匹配，不是自然语言语义搜索。"
             "调用前必须把用户描述的主题概念转换为 Pixiv 中实际存在的常见标签，"
             "优先使用日文标签，并补充常见英文、中文同义标签；不要直接照抄用户自然语言。"
         ),
         activation_type=ActivationType.ALWAYS,
+        timeout_ms=45000,
         parameters=[
             ToolParameterInfo(
                 name="tags",
@@ -615,7 +662,7 @@ class SetuPlugin(MaiBotPlugin):
             ToolParameterInfo(
                 name="num",
                 param_type=ToolParamType.INTEGER,
-                description="请求图片数量，1-3，默认1。每次最多请求3张，不要请求超过3张。",
+                description="随机候选数量，1-3，默认1。最终只发送其中1张，不要请求超过3张。",
                 required=False,
             ),
             ToolParameterInfo(
@@ -650,28 +697,32 @@ class SetuPlugin(MaiBotPlugin):
         if not result["success"]:
             return {"name": "get_setu", "content": "获取图片失败: " + result["error"]}
 
-        setu_list = result["data"]
+        selected_setu = self._select_random_setu(result["data"])
+        if selected_setu is None:
+            return {"name": "get_setu", "content": "获取图片失败: API 未返回有效候选"}
 
-        # 先构建返回信息（不等待图片发送完成，避免RPC超时）
-        detail_parts = []
-        for item in setu_list:
-            title = item.get("title", "未知")
-            author = item.get("author", "未知")
-            pid = item.get("pid", "")
-            tags_str = ", ".join(item.get("tags", []))
-            is_r18 = "是" if item.get("r18") else "否"
-            ai_type = {0: "未知", 1: "非AI", 2: "AI作品"}.get(item.get("aiType", 0), "未知")
-            detail_parts.append("《" + title + "》作者:" + author + " PID:" + str(pid) + " R18:" + is_r18 + " AI:" + ai_type + " 标签:[" + tags_str + "]")
+        # 同步等待发送完成，不再使用 create_task 提前返回
+        title = selected_setu.get("title", "未知")
+        author = selected_setu.get("author", "未知")
+        pid = selected_setu.get("pid", "")
+        tags_str = ", ".join(selected_setu.get("tags", []))
+        is_r18 = "是" if selected_setu.get("r18") else "否"
+        ai_type = {0: "未知", 1: "非AI", 2: "AI作品"}.get(selected_setu.get("aiType", 0), "未知")
+        detail = "《" + title + "》作者:" + author + " PID:" + str(pid) + " R18:" + is_r18 + " AI:" + ai_type + " 标签:[" + tags_str + "]"
 
-        # 异步发送图片（不等待完成）
-        asyncio.create_task(self._send_setu_images(
-            setu_list, stream_id,
+        sent_count, info_lines = await self._send_setu_images(
+            [selected_setu], stream_id,
             group_id=str(kwargs.get("group_id", "")),
             user_id=str(kwargs.get("user_id", "")),
-        ))
+        )
 
-        summary = "图片正在发送给用户（共 " + str(len(setu_list)) + " 张）。"
-        summary += "\n图片信息:\n" + "\n".join(detail_parts)
+        if sent_count > 0:
+            summary = "已发送 1 张图片。"
+            summary += "\n图片信息:\n" + detail
+        else:
+            error_detail = "; ".join(info_lines) if info_lines else "未知发送错误"
+            summary = "图片发送失败: " + error_detail
+            summary += "\n图片信息:\n" + detail
         return {"name": "get_setu", "content": summary}
 
     # ── 2. Tool: enable_r18 ────────────────────────────────
@@ -781,8 +832,8 @@ class SetuPlugin(MaiBotPlugin):
 
             self.ctx.logger.info("[SetuPlugin] /tu 解析: tags=%s r18=%s", tags, request_r18)
 
-            # 命令模式固定返回 1 张
-            num = 1
+            # 命令模式固定获取 3 个候选，最终随机发送 1 张
+            num = 3
 
             r18_level = 0
             if request_r18:
@@ -811,12 +862,20 @@ class SetuPlugin(MaiBotPlugin):
                 await self.ctx.send.text("❌ 获取图片失败: " + result["error"], stream_id)
                 return False, result["error"], True
 
-            setu_list = result["data"]
+            selected_setu = self._select_random_setu(result["data"])
+            if selected_setu is None:
+                await self.ctx.send.text("❌ 获取图片失败: API 未返回有效候选", stream_id)
+                return False, "API 未返回有效候选", True
+
             sent_count, _ = await self._send_setu_images(
-                setu_list, stream_id,
+                [selected_setu], stream_id,
                 group_id=str(kwargs.get("group_id", "")),
                 user_id=str(kwargs.get("user_id", "")),
             )
+
+            if sent_count == 0:
+                await self.ctx.send.text("❌ 图片发送失败，请稍后重试", stream_id)
+                return False, "发送失败: 图片未能成功发送", True
 
             return True, "已发送 " + str(sent_count) + " 张图片", True
         except Exception as e:

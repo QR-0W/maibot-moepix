@@ -44,6 +44,13 @@ default_size = ["regular"]
 # 如果服务器已配置代理/VPN，建议留空使用直连。
 proxy = ""
 
+# HTTP 代理地址。
+# 用于访问 Lolicon API 时的网络代理（不涉及图片反代）。
+# 当服务器无法直连 api.lolicon.app 时，可通过本地 Clash/mihomo 等代理访问。
+# 格式示例：http://127.0.0.1:52117 或 socks5://127.0.0.1:52118
+# 留空则不使用代理直连。
+http_proxy = ""
+
 # 是否排除 AI 生成的作品。建议保持 true，避免潜在的版权争议。
 exclude_ai = true
 
